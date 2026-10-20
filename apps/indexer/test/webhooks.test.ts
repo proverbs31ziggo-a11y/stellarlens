@@ -13,11 +13,11 @@ import { describe, expect, it, vi } from "vitest";
 import { WEBHOOK_MAX_RETRIES, STELLAR_NETWORK as NETWORK } from "../src/config.js";
 import { processEventsBatch } from "../src/events.js";
 import { registerContract } from "../src/registry.js";
-import { deliverWebhooksForEvent } from "../src/webhooks.js";
+import { assertPublicWebhookUrl, deliverWebhooksForEvent } from "../src/webhooks.js";
 import { mockJsonRpc, TEST_RPC_URL } from "./rpc-mocks.js";
 import { getTestDb, mswServer } from "./setup.js";
 
-const WEBHOOK_URL = "http://localhost:9999/webhook-endpoint";
+const WEBHOOK_URL = "http://8.8.8.8/webhook-endpoint";
 
 function symbolXdr(value: string): string {
   return nativeToScVal(value, { type: "symbol" }).toXdr("base64");
@@ -42,10 +42,39 @@ function buildLatestLedger(sequence: number) {
   };
 }
 
-async function registerWebhook(contractId: number, secret: string, eventTypes?: string[]) {
+async function registerWebhook(
+  contractId: number,
+  secret: string,
+  eventTypes?: string[],
+  active = true
+) {
   const db = getTestDb();
-  await db.insert(webhooksTable).values({ contractId, url: WEBHOOK_URL, secret, eventTypes: eventTypes ?? null });
+  await db
+    .insert(webhooksTable)
+    .values({ contractId, url: WEBHOOK_URL, secret, eventTypes: eventTypes ?? null, active });
 }
+
+describe("webhook URL IP validation", () => {
+  it("rejects a URL that resolves to a private IPv4 address", async () => {
+    await expect(
+      assertPublicWebhookUrl("https://hooks.example.com", async () => [{ address: "10.0.0.12" }])
+    ).rejects.toThrow("non-public IP address");
+  });
+
+  it("rejects a URL with an IPv6 unique-local address", async () => {
+    await expect(assertPublicWebhookUrl("http://[fd12::1]/webhook")).rejects.toThrow(
+      "non-public IP address"
+    );
+  });
+
+  it("allows a URL that resolves to a public IP address", async () => {
+    await expect(
+      assertPublicWebhookUrl("https://hooks.example.com", async () => [
+        { address: "93.184.216.34" }
+      ])
+    ).resolves.toBeUndefined();
+  });
+});
 
 describe("webhook delivery", () => {
   it("fires a signed POST to every webhook registered for the indexed event's contract", async () => {
@@ -89,7 +118,11 @@ describe("webhook delivery", () => {
     const expectedSignature = createHmac("sha256", secret).update(receivedBody).digest("hex");
     expect(receivedSignature).toBe(`sha256=${expectedSignature}`);
 
-    const payload = JSON.parse(receivedBody) as { contractId: number; ledger: number; txHash: string };
+    const payload = JSON.parse(receivedBody) as {
+      contractId: number;
+      ledger: number;
+      txHash: string;
+    };
     expect(payload.contractId).toBe(contract.id);
     expect(payload.ledger).toBe(5005);
     expect(payload.txHash).toBe("d".repeat(64));
@@ -97,7 +130,10 @@ describe("webhook delivery", () => {
 
   it("persists a successful delivery with its attempt count and deliveredAt", async () => {
     const db = getTestDb();
-    const contract = await registerContract(db, { address: "CONTRACT_HOOK_DELIVERY_SUCCESS", network: NETWORK });
+    const contract = await registerContract(db, {
+      address: "CONTRACT_HOOK_DELIVERY_SUCCESS",
+      network: NETWORK
+    });
     await registerWebhook(contract.id, "success-secret");
 
     mswServer.use(
@@ -138,7 +174,10 @@ describe("webhook delivery", () => {
 
   it("persists a failed delivery after retries are exhausted", { timeout: 15000 }, async () => {
     const db = getTestDb();
-    const contract = await registerContract(db, { address: "CONTRACT_HOOK_DELIVERY_FAILED", network: NETWORK });
+    const contract = await registerContract(db, {
+      address: "CONTRACT_HOOK_DELIVERY_FAILED",
+      network: NETWORK
+    });
     await registerWebhook(contract.id, "failed-secret");
 
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -166,10 +205,14 @@ describe("webhook delivery", () => {
     );
 
     const { indexedCount } = await processEventsBatch(db, makeServer());
-    consoleError.mockRestore();
 
     expect(indexedCount).toBe(1);
     expect(webhookSpy).toHaveBeenCalledTimes(WEBHOOK_MAX_RETRIES + 1);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("CONTRACT_HOOK_DELIVERY_FAILED"),
+      expect.any(Error)
+    );
+    consoleError.mockRestore();
 
     const [event] = await db.select().from(eventsTable);
     const [delivery] = await db.select().from(webhookDeliveries);
@@ -212,6 +255,7 @@ describe("webhook delivery", () => {
       deliverWebhooksForEvent(failingDb, {
         eventId: 42,
         contractId: 1,
+        contractAddress: "CONTRACT_DELIVERY_LOG",
         ledger: 1,
         txHash: "2".repeat(64),
         topic: ["fee"],
@@ -228,7 +272,10 @@ describe("webhook delivery", () => {
 
   it("retries a failing webhook before giving up, without failing the indexing batch", async () => {
     const db = getTestDb();
-    const contract = await registerContract(db, { address: "CONTRACT_HOOK_RETRY", network: NETWORK });
+    const contract = await registerContract(db, {
+      address: "CONTRACT_HOOK_RETRY",
+      network: NETWORK
+    });
     await registerWebhook(contract.id, "retry-secret");
 
     let callCount = 0;
@@ -269,7 +316,10 @@ describe("webhook delivery", () => {
 
   it("skips a webhook whose eventTypes doesn't include the event's topic", async () => {
     const db = getTestDb();
-    const contract = await registerContract(db, { address: "CONTRACT_HOOK_FILTERED", network: NETWORK });
+    const contract = await registerContract(db, {
+      address: "CONTRACT_HOOK_FILTERED",
+      network: NETWORK
+    });
     await registerWebhook(contract.id, "filtered-secret", ["mint"]);
 
     const webhookSpy = vi.fn(() => HttpResponse.json({ ok: true }));
@@ -300,9 +350,50 @@ describe("webhook delivery", () => {
     expect(webhookSpy).not.toHaveBeenCalled();
   });
 
+  it("skips an inactive webhook", async () => {
+    const db = getTestDb();
+    const contract = await registerContract(db, {
+      address: "CONTRACT_HOOK_INACTIVE",
+      network: NETWORK
+    });
+    await registerWebhook(contract.id, "inactive-secret", undefined, false);
+
+    const webhookSpy = vi.fn(() => HttpResponse.json({ ok: true }));
+
+    mswServer.use(
+      mockJsonRpc({
+        getLatestLedger: () => buildLatestLedger(8200),
+        getEvents: () => ({
+          events: [
+            {
+              id: "0000000000000000000-0000000000",
+              ledger: 8205,
+              txHash: "c".repeat(64),
+              contractId: "CONTRACT_HOOK_INACTIVE",
+              topic: [symbolXdr("fee")],
+              value: i128Xdr(-1n)
+            }
+          ],
+          cursor: "CURSOR_HOOK_INACTIVE",
+          latestLedger: 8205
+        })
+      }),
+      http.post(WEBHOOK_URL, webhookSpy)
+    );
+
+    await processEventsBatch(db, makeServer());
+
+    expect(webhookSpy).not.toHaveBeenCalled();
+    const deliveryRows = await db.select().from(webhookDeliveries);
+    expect(deliveryRows).toHaveLength(0);
+  });
+
   it("fires a webhook whose eventTypes includes the event's topic", async () => {
     const db = getTestDb();
-    const contract = await registerContract(db, { address: "CONTRACT_HOOK_MATCHED", network: NETWORK });
+    const contract = await registerContract(db, {
+      address: "CONTRACT_HOOK_MATCHED",
+      network: NETWORK
+    });
     await registerWebhook(contract.id, "matched-secret", ["fee", "mint"]);
 
     const webhookSpy = vi.fn(() => HttpResponse.json({ ok: true }));
@@ -360,7 +451,10 @@ describe("webhook delivery", () => {
     const { indexedCount } = await processEventsBatch(db, makeServer());
     expect(indexedCount).toBe(1);
 
-    const [row] = await db.select().from(contracts).where(eq(contracts.address, "CONTRACT_NO_HOOK"));
+    const [row] = await db
+      .select()
+      .from(contracts)
+      .where(eq(contracts.address, "CONTRACT_NO_HOOK"));
     expect(row).toBeDefined();
   });
 });

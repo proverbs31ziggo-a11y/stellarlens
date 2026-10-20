@@ -207,6 +207,36 @@ describe("processEventsBatch", () => {
     expect(eventRows).toHaveLength(1);
   });
 
+  it("does not insert a duplicate transfer when the ledger range is reprocessed", async () => {
+    const db = getTestDb();
+    await registerContract(db, { address: "CONTRACT_DUPLICATE_TRANSFER", network: NETWORK });
+
+    mswServer.use(
+      mockJsonRpc({
+        getLatestLedger: () => buildLatestLedger(3100),
+        getEvents: () => ({
+          events: [
+            buildRawEvent({
+              contractId: "CONTRACT_DUPLICATE_TRANSFER",
+              ledger: 3110,
+              txHash: "d".repeat(64),
+              topic: [symbolXdr("transfer"), addressXdr(ADDRESS_A), addressXdr(ADDRESS_B)],
+              value: i128Xdr(30000000n)
+            })
+          ],
+          cursor: "CURSOR_DUPLICATE_TRANSFER",
+          latestLedger: 3110
+        })
+      })
+    );
+
+    await processEventsBatch(db, makeServer());
+    await processEventsBatch(db, makeServer());
+
+    const transferRows = await db.select().from(tokenTransfers);
+    expect(transferRows).toHaveLength(1);
+  });
+
   it("skips events from unregistered contracts", async () => {
     const db = getTestDb();
     await registerContract(db, { address: "CONTRACT_REGISTERED", network: NETWORK });

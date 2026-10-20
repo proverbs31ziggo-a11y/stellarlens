@@ -1,4 +1,4 @@
-import { bigint, index, integer, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
+import { bigint, boolean, index, integer, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
 import { contracts } from "./contracts.js";
 import { events } from "./events.js";
 
@@ -12,6 +12,7 @@ export const webhooks = pgTable(
     url: text("url").notNull(),
     secret: text("secret").notNull(),
     eventTypes: text("event_types").array(),
+    active: boolean("active").default(true).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull()
   },
   (table) => [index("webhooks_contract_id_idx").on(table.contractId)]

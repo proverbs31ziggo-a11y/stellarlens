@@ -1,4 +1,4 @@
-import { bigint, bigserial, index, integer, numeric, pgTable, text, timestamp } from "drizzle-orm/pg-core";
+import { bigint, bigserial, index, integer, numeric, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { contracts } from "./contracts.js";
 
 export const tokenTransfers = pgTable(
@@ -19,6 +19,7 @@ export const tokenTransfers = pgTable(
   (table) => [
     index("token_transfers_contract_id_idx").on(table.contractId),
     index("token_transfers_tx_hash_idx").on(table.txHash),
-    index("token_transfers_ledger_idx").on(table.ledger)
+    index("token_transfers_ledger_idx").on(table.ledger),
+    uniqueIndex("token_transfers_contract_tx_ledger_uidx").on(table.contractId, table.txHash, table.ledger)
   ]
 );

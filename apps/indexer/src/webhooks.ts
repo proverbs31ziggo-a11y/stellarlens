@@ -1,16 +1,102 @@
 import { createHmac } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { webhookDeliveries as webhookDeliveriesTable, webhooks as webhooksTable, type Database } from "@stellarlens/db";
-import { WEBHOOK_MAX_RETRIES, WEBHOOK_RETRY_BASE_DELAY_MS, WEBHOOK_RETRY_MAX_DELAY_MS, WEBHOOK_TIMEOUT_MS } from "./config.js";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { and, eq } from "drizzle-orm";
+import {
+  webhookDeliveries as webhookDeliveriesTable,
+  webhooks as webhooksTable,
+  type Database
+} from "@stellarlens/db";
+import {
+  WEBHOOK_MAX_RETRIES,
+  WEBHOOK_RETRY_BASE_DELAY_MS,
+  WEBHOOK_RETRY_MAX_DELAY_MS,
+  WEBHOOK_TIMEOUT_MS
+} from "./config.js";
 import { withRetry } from "./retry.js";
 
 export interface WebhookEventPayload {
   eventId: number;
   contractId: number;
+  contractAddress: string;
   ledger: number;
   txHash: string;
   topic: unknown[];
   value: unknown;
+}
+
+type DnsResolver = (hostname: string) => Promise<Array<{ address: string }>>;
+
+function ipv4IsPublic(address: string): boolean {
+  const octets = address.split(".").map(Number);
+  const [first, second, third] = octets;
+
+  return !(
+    first === 0 ||
+    first === 10 ||
+    (first === 100 && second >= 64 && second <= 127) ||
+    first === 127 ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && (second === 0 || second === 168)) ||
+    (first === 192 && second === 88 && third === 99) ||
+    (first === 198 && (second === 18 || second === 19)) ||
+    (first === 198 && second === 51 && third === 100) ||
+    (first === 203 && second === 0 && third === 113) ||
+    first >= 224
+  );
+}
+
+function ipv6ToBigInt(address: string): bigint {
+  let normalized = address.toLowerCase();
+  const ipv4Suffix = normalized.match(/(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (ipv4Suffix) {
+    const octets = ipv4Suffix[1].split(".").map(Number);
+    const high = ((octets[0] << 8) | octets[1]).toString(16);
+    const low = ((octets[2] << 8) | octets[3]).toString(16);
+    normalized = normalized.replace(ipv4Suffix[1], `${high}:${low}`);
+  }
+
+  const [left = "", right] = normalized.split("::");
+  const leftGroups = left ? left.split(":") : [];
+  const rightGroups = right ? right.split(":") : [];
+  const zeroGroups = Array(8 - leftGroups.length - rightGroups.length).fill("0");
+  const groups = [...leftGroups, ...zeroGroups, ...rightGroups];
+
+  return groups.reduce((value, group) => (value << 16n) | BigInt(`0x${group || "0"}`), 0n);
+}
+
+function ipIsPublic(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    return ipv4IsPublic(address);
+  }
+  if (family !== 6) {
+    return false;
+  }
+
+  const value = ipv6ToBigInt(address);
+  if (value >> 32n === 0xffffn) {
+    const ipv4Bytes = (value & 0xffffffffn).toString(16).padStart(8, "0").match(/.{2}/g)!;
+    return ipv4IsPublic(ipv4Bytes.map((byte) => parseInt(byte, 16)).join("."));
+  }
+
+  const globalUnicast = value >> 125n === 0b001n;
+  const documentation = value >> 96n === 0x20010db8n;
+  const specialUse = value >> 105n === 0x100080n || value >> 112n === 0x2002n;
+  return globalUnicast && !documentation && !specialUse;
+}
+
+export async function assertPublicWebhookUrl(
+  url: string,
+  resolve: DnsResolver = (hostname) => lookup(hostname, { all: true, verbatim: true })
+): Promise<void> {
+  const hostname = new URL(url).hostname.replace(/^\[|\]$/g, "");
+  const addresses = isIP(hostname) ? [{ address: hostname }] : await resolve(hostname);
+
+  if (addresses.length === 0 || addresses.some(({ address }) => !ipIsPublic(address))) {
+    throw new Error("webhook URL resolves to a non-public IP address");
+  }
 }
 
 async function postWebhook(url: string, body: string, signature: string): Promise<void> {
@@ -37,7 +123,10 @@ async function postWebhook(url: string, body: string, signature: string): Promis
 }
 
 /** A webhook with no eventTypes fires on everything; otherwise the event's topic[0] must be in the list. */
-function matchesEventTypes(webhook: { eventTypes: string[] | null }, payload: WebhookEventPayload): boolean {
+function matchesEventTypes(
+  webhook: { eventTypes: string[] | null },
+  payload: WebhookEventPayload
+): boolean {
   if (!webhook.eventTypes || webhook.eventTypes.length === 0) {
     return true;
   }
@@ -72,15 +161,26 @@ async function recordDelivery(
 }
 
 /** Best-effort delivery: failures are logged, never thrown, so one bad endpoint can't stall indexing. */
-export async function deliverWebhooksForEvent(db: Database, payload: WebhookEventPayload): Promise<void> {
+export async function deliverWebhooksForEvent(
+  db: Database,
+  payload: WebhookEventPayload
+): Promise<void> {
   let recipients: Array<typeof webhooksTable.$inferSelect>;
 
   try {
     recipients = (
-      await db.select().from(webhooksTable).where(eq(webhooksTable.contractId, payload.contractId))
+      await db
+        .select()
+        .from(webhooksTable)
+        .where(
+          and(eq(webhooksTable.contractId, payload.contractId), eq(webhooksTable.active, true))
+        )
     ).filter((webhook) => matchesEventTypes(webhook, payload));
   } catch (err) {
-    console.error(`webhook recipients could not be loaded for contract ${payload.contractId}:`, err);
+    console.error(
+      `webhook recipients could not be loaded for contract ${payload.contractId}:`,
+      err
+    );
     return;
   }
 
@@ -88,7 +188,8 @@ export async function deliverWebhooksForEvent(db: Database, payload: WebhookEven
     return;
   }
 
-  const body = JSON.stringify(payload);
+  const { contractAddress, ...eventPayload } = payload;
+  const body = JSON.stringify(eventPayload);
 
   await Promise.all(
     recipients.map(async (webhook) => {
@@ -96,6 +197,7 @@ export async function deliverWebhooksForEvent(db: Database, payload: WebhookEven
 
       try {
         const signature = createHmac("sha256", webhook.secret).update(body).digest("hex");
+        await assertPublicWebhookUrl(webhook.url);
         await withRetry(
           `webhook:${webhook.id}`,
           () => {
@@ -118,7 +220,10 @@ export async function deliverWebhooksForEvent(db: Database, payload: WebhookEven
           deliveredAt: new Date()
         });
       } catch (err) {
-        console.error(`webhook ${webhook.id} delivery failed after retries:`, err);
+        console.error(
+          `webhook ${webhook.id} for contract ${contractAddress} delivery failed after retries:`,
+          err
+        );
 
         await recordDelivery(db, {
           webhookId: webhook.id,
